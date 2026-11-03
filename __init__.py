@@ -36,6 +36,7 @@ from safetensors import safe_open
 
 import comfy.conds
 import comfy.ldm.common_dit
+from comfy.ldm.anima.model import Anima as AnimaModel
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.samplers
@@ -59,6 +60,22 @@ _adapters: dict[tuple, "_Adapter"] = {}  # adapter key -> loaded weights, shared
 _active = {"key": None}                  # key of the adapter whose LoRA the hooks apply right now
 _warned_sizes: set = set()
 _warned_slots: set = set()
+
+# Anima-2.9B inserts these blocks into the 28-block base, shifting its original layers.
+_INSERTED_29B = frozenset((2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36))
+
+
+def _adapter_block_map(indices, model) -> tuple[int, ...]:
+    indices = set(indices)
+    if not indices:
+        raise ValueError("Adapter has no diffusion block weights")
+    model_blocks = len(model.blocks)
+    if max(indices) + 1 == model_blocks:
+        return tuple(range(model_blocks))
+    if isinstance(model, AnimaModel) and model_blocks == 40 and indices == set(range(28)):
+        return tuple(i for i in range(40) if i not in _INSERTED_29B)
+    raise ValueError(f"Adapter covers {max(indices) + 1} blocks but the model has {model_blocks}. "
+                     "Only native layouts and the 28-to-40-block Anima-2.9B expansion are supported.")
 
 
 def _lora_names() -> list[str]:
@@ -102,6 +119,7 @@ class _Adapter:
             self.weights[name] = [down, up, strength * alpha / down.shape[0]]
         if not self.weights:
             raise ValueError(f"{path} has no lora_down/lora_up weights")
+        self.block_indices = {int(n.split(".")[1]) for n in self.weights if n.startswith("blocks.")}
         metadata = _read_metadata(path)
         self.slots = metadata.get("slots") or SINGLE_SLOTS
         self.asym = metadata.get("arch") == "asym"
@@ -116,8 +134,16 @@ class _Adapter:
         return _adapters[key]
 
     def install(self, diffusion_model) -> None:
+        block_map = _adapter_block_map(self.block_indices, diffusion_model)
+        # Resolve everything before installing hooks, so a missing target cannot leave a partial install.
+        targets = []
         for name, entry in self.weights.items():
+            if name.startswith("blocks."):
+                _, index, suffix = name.split(".", 2)
+                name = f"blocks.{block_map[int(index)]}.{suffix}"
             module = diffusion_model.get_submodule(name)
+            targets.append((module, entry))
+        for module, entry in targets:
             installed = getattr(module, HOOKS_ATTR, None)
             if installed is None:
                 installed = {}

@@ -93,6 +93,19 @@ Step by step, with prompt tips and troubleshooting: **[user guide](docs/guide.en
 
 ## Speed and compatibility
 
+Anima-2.9B's known 40-block depth expansion is detected automatically when a released
+28-block adapter is loaded. The adapter's hooks follow the original layers at
+`0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 39`.
+The 12 inserted layers keep their own weights; no adapter weights are copied into them.
+Reference K/V encoding and lookup still follow all 40 actual layers. Native model/adapter
+layouts keep their original routing; other block-count mismatches raise an error instead
+of silently attaching to the wrong layers. No extra node or setting is needed.
+
+This fixes hook routing, not the training distribution: the adapters were trained on
+Anima base v1.0. Reference quality on 2.9B and its finetunes still needs render evaluation.
+CPU routing and reference-cache regression tests (PyTorch required, no ComfyUI or model
+downloads): `python -m unittest discover -s tests -p 'test_block_layout.py'`.
+
 RTX 3060 Ti 8 GB (fp16), 832x1216, one reference; the faster of two runs:
 
 | setup | time per image |
