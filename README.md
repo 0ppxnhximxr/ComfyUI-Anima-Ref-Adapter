@@ -91,6 +91,38 @@ sampler, and connect the VAE and the reference image.
 
 Step by step, with prompt tips and troubleshooting: **[user guide](docs/guide.en.md)**.
 
+## SnapRef adapters
+
+The **Anima Ref Adapter** node also reads [SnapRef](https://github.com/ArcAnima/SnapRef)
+`anima_ref_kv/1` adapters, including per-row FP8 weights. Download
+[`snapref_v2a.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a)
+into `ComfyUI/models/loras/` and open
+[`workflows/anima_ref_adapter_snapref.json`](workflows/anima_ref_adapter_snapref.json).
+Connect the Anima **CLIP** output to the node's optional `clip` input; SnapRef needs
+it even when `ref_caption` is empty. The adapter format is detected from metadata,
+so renaming the file is fine. Existing pilot/v2 workflows keep their settings and behavior.
+
+| setting | SnapRef behavior |
+|---|---|
+| `snapref_mode` | `cs`: character and style; `char`: character only, with style from your prompt/model |
+| `strength` | Linear reference attention weight: 1 = trained default, 0 = bypass. This is separate from the LoRA multiplier used by pilot/v2. |
+| `ref_caption` | Optional appearance tags for the reference; empty works. |
+| `snapref_guidance` | Off by default: only the positive CFG branch reads the reference, as trained. On: both branches read it and `ref_guidance`, `correction`, and `ref_end` apply. |
+| `ref_megapixels` | Maximum reference area; small images are not enlarged. |
+
+SnapRef support here is for one reference through the integrated **Anima Ref Adapter**
+node. The separate Loader/Latent/Guider nodes remain for pilot/v2 adapters. For multiple
+references or Fidelity, use the original SnapRef nodes. Do not stack the two adapters
+on the same model chain. Reference K/V is released when sampling finishes, including on failure.
+This backend uses ComfyUI's Anima attention APIs; use ComfyUI 0.29.0 or newer.
+Core MultiGPU sampling is rejected because the stream hooks share adapter state.
+
+The SnapRef path also supports sorryhyun's Spectrum/Mod Guidance hooks: the clean
+reference is encoded without target modulation, and a mixed CFG batch stays intact
+while only its positive rows read the reference. This prevents the reported 4-vs-2
+batch error. Spectrum 2.13.4 additionally needs its own projection-row expansion fix
+for actual image batches larger than one; that is separate from SnapRef's CFG handling.
+
 ## Speed and compatibility
 
 Anima-2.9B's known 40-block depth expansion is detected automatically when a released

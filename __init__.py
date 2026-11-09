@@ -530,14 +530,34 @@ class AnimaRefAdapter:
                                              "stays in after it. ~0.6 saves time with nearly the same image"}),
             "ref_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 2.0, "step": 0.05,
                                          "tooltip": "the reference is resized to this area, keeping its aspect ratio"}),
+            "clip": ("CLIP", {"tooltip": "required only for SnapRef adapters; use the Anima text encoder"}),
+            "snapref_mode": (["cs", "char"], {"tooltip": "SnapRef only: character and style, or character only"}),
+            "ref_caption": ("STRING", {"default": "", "multiline": True,
+                                       "tooltip": "SnapRef only: optional reference appearance tags; empty works"}),
+            "snapref_guidance": ("BOOLEAN", {"default": False, "tooltip": "SnapRef only: enable ref_guidance, correction "
+                                     "and ref_end. Off keeps the trained positive-only reference behavior"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "Anima Ref Adapter"
 
-    def apply(self, model, vae, image, lora_name, ref_guidance, correction, strength=1.0, ref_end=1.0, ref_megapixels=1.0):
-        adapter = _Adapter.get(_lora_path(lora_name), strength)
+    def apply(self, model, vae, image, lora_name, ref_guidance, correction, strength=1.0, ref_end=1.0, ref_megapixels=1.0,
+              clip=None, snapref_mode="cs", ref_caption="", snapref_guidance=False):
+        from . import snapref
+        path = _lora_path(lora_name)
+        if snapref.metadata(path) is not None:
+            (m,) = snapref.apply(model, clip, vae, image, path, snapref_mode, ref_caption, strength,
+                                 ref_megapixels, snapref_guidance)
+            if strength == 0 or not snapref_guidance:
+                return (m,)
+        else:
+            return self._apply_legacy(model, vae, image, path, ref_guidance, correction, strength, ref_end, ref_megapixels)
+        m.set_model_sampler_post_cfg_function(self._post_cfg(ref_guidance, correction, ref_end))
+        return (m,)
+
+    def _apply_legacy(self, model, vae, image, path, ref_guidance, correction, strength, ref_end, ref_megapixels):
+        adapter = _Adapter.get(path, strength)
         adapter.install(model.get_model_object("diffusion_model"))
         pixels = image[:1].movedim(-1, 1)
         scale = (ref_megapixels * 1024 * 1024 / (pixels.shape[-1] * pixels.shape[-2])) ** 0.5
@@ -552,6 +572,11 @@ class AnimaRefAdapter:
         if adapter.asym:
             m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY, _make_outer_sample_wrapper(adapter))
 
+        m.set_model_sampler_post_cfg_function(self._post_cfg(ref_guidance, correction, ref_end))
+        return (m,)
+
+    @staticmethod
+    def _post_cfg(ref_guidance, correction, ref_end):
         def post_cfg(args):
             guided, pos = args["denoised"], args["cond_denoised"]
             if ref_guidance != 1.0 and _in_window(args["model"].model_sampling, args["sigma"], 0.0, ref_end):
@@ -564,8 +589,7 @@ class AnimaRefAdapter:
                 guided = guided + (ref_guidance - 1.0) * (ref - base)
             return _correct(guided, pos, correction, 0.5)
 
-        m.set_model_sampler_post_cfg_function(post_cfg)
-        return (m,)
+        return post_cfg
 
 
 class AnimaRefGuiderImpl(comfy.samplers.CFGGuider):
