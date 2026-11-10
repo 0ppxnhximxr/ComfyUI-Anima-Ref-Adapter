@@ -13,6 +13,7 @@ Other extensions are reached only through ComfyUI's contracts, never their inter
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import weakref
@@ -25,13 +26,22 @@ from safetensors.torch import load_file
 import comfy.patcher_extension
 import comfy.utils
 
-from . import _adapter_block_map, _rope_from_positions, _frame_positions
+from . import NO_REF_KEY, _adapter_block_map, _rope_from_positions, _frame_positions
 
 WRAPPER_KEY = "anima_ref_snapref"
 STATE_ATTR = "_anima_ref_snapref_state"
-NO_REF_KEY = "anima_ref_off"
+HOOK_ATTR = "_anima_ref_snapref_hooked"
 _STATE = {"adapter": None, "stream": None}
 _adapters = {}
+
+
+def _lora_hook(module, inputs, output):
+    """One hook per Linear for every SnapRef adapter; the active adapter decides whether it has a LoRA here."""
+    adapter, stream = _STATE["adapter"], _STATE["stream"]
+    name = adapter.targets.get(module) if adapter is not None else None
+    if name is None or stream not in adapter.lora[name]:
+        return output
+    return output + adapter.delta(name, stream, inputs[0])
 
 
 def metadata(path):
@@ -74,6 +84,7 @@ class Adapter:
             self.lora.setdefault(name, {})[stream] = [*weights, float(tensors[root + "alpha"]) / weights[0].shape[0]]
         self.block_indices = {int(n.split(".")[1]) for n in self.lora if n.startswith("blocks.")}
         self.hooked = weakref.WeakSet()
+        self.targets = weakref.WeakKeyDictionary()  # Linear module -> LoRA name, for every hooked model
         self.cache = {}
         self.on_device = {}  # (name, stream) -> device copies; the CPU weights above are never replaced
 
@@ -90,9 +101,9 @@ class Adapter:
         self.on_device.clear()
 
     def install(self, dm):
-        block_map = _adapter_block_map(self.block_indices, dm)
         if dm in self.hooked:
             return
+        block_map = _adapter_block_map(self.block_indices, dm)
         targets = []
         for name in self.lora:
             path = name
@@ -101,11 +112,10 @@ class Adapter:
                 path = f"blocks.{block_map[int(index)]}.{suffix}"
             targets.append((dm.get_submodule(path), name))
         for module, name in targets:
-            def hook(module, inputs, output, name=name):
-                if _STATE["adapter"] is not self or _STATE["stream"] not in self.lora[name]:
-                    return output
-                return output + self.delta(name, _STATE["stream"], inputs[0])
-            module.register_forward_hook(hook)
+            self.targets[module] = name
+            if not getattr(module, HOOK_ATTR, False):  # a reloaded or second adapter file reuses the hook
+                module.register_forward_hook(_lora_hook)
+                setattr(module, HOOK_ATTR, True)
         for index, block in enumerate(dm.blocks):
             attn = block.self_attn
             if hasattr(attn, STATE_ATTR):
@@ -247,6 +257,8 @@ def apply(model, clip, vae, image, path, mode, caption, weight, megapixels, guid
     if mode not in adapter.modes:
         raise ValueError(f"SnapRef mode {mode!r} is not supported by this adapter ({adapter.modes})")
     _adapter_block_map(adapter.block_indices, model.get_model_object("diffusion_model"))
+    if image.shape[0] > 1:
+        logging.warning(f"[Anima Ref Adapter] SnapRef reads one reference; using the first of {image.shape[0]} images")
     pixels = image[:1].movedim(-1, 1)
     h, w = pixels.shape[-2:]
     scale = min(1., (megapixels * 1024 * 1024 / (h * w)) ** .5)

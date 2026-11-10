@@ -182,6 +182,16 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(self.adapter.on_device)
         self.assertIs(self.adapter.lora["blocks.0.self_attn.q_proj"]["tgt"][1], cpu)
 
+    def test_reloaded_file_reuses_one_hook_per_module(self):
+        model = Model()
+        self.adapter.install(model)
+        reloaded = self.backend.Adapter(str(self.path))
+        reloaded.install(model)
+        self.assertEqual(len(model.blocks[0].self_attn.q_proj._forward_hooks), 1)
+        for adapter in (self.adapter, reloaded):
+            self.backend._STATE.update(adapter=adapter, stream="tgt")
+            torch.testing.assert_close(model.blocks[0].self_attn.q_proj(torch.ones(1, 2)), torch.full((1, 2), 3.))
+
     def test_fp8_scales_are_applied_before_lora_delta(self):
         write_adapter(self.path, fp8=True)
         adapter = self.backend.Adapter(str(self.path))
