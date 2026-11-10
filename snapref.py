@@ -83,26 +83,36 @@ class Adapter:
         self.block_indices = {int(n.split(".")[1]) for n in self.lora if n.startswith("blocks.")}
         self.hooked = weakref.WeakSet()
         self.cache = {}
+        self.on_device = {}  # (name, stream) -> device copies; the CPU weights above are never replaced
+
+    def delta(self, name, stream, x):
+        weights = self.on_device.get((name, stream))
+        if weights is None or weights[0].device != x.device or weights[0].dtype != x.dtype:
+            down, up, scale = self.lora[name][stream]
+            weights = self.on_device[(name, stream)] = (down.to(x), up.to(x), scale)
+        return F.linear(F.linear(x, weights[0]), weights[1]) * weights[2]
+
+    def release(self):
+        """Drop the reference K/V and the device copies of the LoRA weights (ComfyUI does not track either)."""
+        self.cache.clear()
+        self.on_device.clear()
 
     def install(self, dm):
         block_map = _adapter_block_map(self.block_indices, dm)
         if dm in self.hooked:
             return
         targets = []
-        for name, streams in self.lora.items():
+        for name in self.lora:
+            path = name
             if name.startswith("blocks."):
                 _, index, suffix = name.split(".", 2)
-                name = f"blocks.{block_map[int(index)]}.{suffix}"
-            targets.append((dm.get_submodule(name), streams))
-        for module, streams in targets:
-            def hook(module, inputs, output, streams=streams):
-                if _STATE["adapter"] is not self or _STATE["stream"] not in streams:
+                path = f"blocks.{block_map[int(index)]}.{suffix}"
+            targets.append((dm.get_submodule(path), name))
+        for module, name in targets:
+            def hook(module, inputs, output, name=name):
+                if _STATE["adapter"] is not self or _STATE["stream"] not in self.lora[name]:
                     return output
-                entry = streams[_STATE["stream"]]
-                x = inputs[0]
-                if entry[0].device != x.device or entry[0].dtype != x.dtype:
-                    entry[0], entry[1] = entry[0].to(x), entry[1].to(x)
-                return output + F.linear(F.linear(x, entry[0]), entry[1]) * entry[2]
+                return output + self.delta(name, _STATE["stream"], inputs[0])
             module.register_forward_hook(hook)
         for index, block in enumerate(dm.blocks):
             attn = block.self_attn
@@ -232,7 +242,7 @@ def outer_wrapper(adapter):
         try:
             return executor(*args, **kwargs)
         finally:
-            adapter.cache.clear()
+            adapter.release()
     return wrapper
 
 

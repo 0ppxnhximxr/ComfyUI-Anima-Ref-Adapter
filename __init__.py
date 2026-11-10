@@ -125,6 +125,20 @@ class _Adapter:
         self.asym = metadata.get("arch") == "asym"
         self.ref_lora = metadata.get("ref_lora", True)
         self.ref_cache: dict = {}  # reference fingerprint -> per-block (k, v), asym adapters only
+        self.on_device: dict = {}  # name -> device copies of (down, up); self.weights stays on the CPU
+
+    def delta(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        weights = self.on_device.get(name)
+        if weights is None or weights[0].device != x.device or weights[0].dtype != x.dtype:
+            down, up, scale = self.weights[name]
+            weights = self.on_device[name] = (down.to(device=x.device, dtype=x.dtype),
+                                              up.to(device=x.device, dtype=x.dtype), scale)
+        return F.linear(F.linear(x, weights[0]), weights[1]) * weights[2]
+
+    def release(self) -> None:
+        """Drop the reference K/V and the device copies of the LoRA (ComfyUI's memory manager tracks neither)."""
+        self.ref_cache.clear()
+        self.on_device.clear()
 
     @classmethod
     def get(cls, path: str, strength: float) -> "_Adapter":
@@ -137,13 +151,13 @@ class _Adapter:
         block_map = _adapter_block_map(self.block_indices, diffusion_model)
         # Resolve everything before installing hooks, so a missing target cannot leave a partial install.
         targets = []
-        for name, entry in self.weights.items():
+        for name in self.weights:
+            path = name
             if name.startswith("blocks."):
                 _, index, suffix = name.split(".", 2)
-                name = f"blocks.{block_map[int(index)]}.{suffix}"
-            module = diffusion_model.get_submodule(name)
-            targets.append((module, entry))
-        for module, entry in targets:
+                path = f"blocks.{block_map[int(index)]}.{suffix}"
+            targets.append((diffusion_model.get_submodule(path), name))
+        for module, name in targets:
             installed = getattr(module, HOOKS_ATTR, None)
             if installed is None:
                 installed = {}
@@ -151,14 +165,10 @@ class _Adapter:
             if self.key in installed:
                 continue
 
-            def hook(module, inputs, output, entry=entry, key=self.key):
-                if _active["key"] != key:
+            def hook(module, inputs, output, name=name):
+                if _active["key"] != self.key:
                     return output
-                x = inputs[0]
-                if entry[0].device != x.device or entry[0].dtype != x.dtype:
-                    entry[0] = entry[0].to(device=x.device, dtype=x.dtype)
-                    entry[1] = entry[1].to(device=x.device, dtype=x.dtype)
-                return output + F.linear(F.linear(x, entry[0]), entry[1]) * entry[2]
+                return output + self.delta(name, inputs[0])
 
             installed[self.key] = module.register_forward_hook(hook)
 
@@ -393,13 +403,13 @@ def _make_wrapper(adapter: _Adapter, offset_ratio: float):
 
 
 def _make_outer_sample_wrapper(adapter: _Adapter):
-    """Free the reference cache when a sampling run ends, so its VRAM is not held between runs or
-    between the chains of a workflow (as comfy_extras/nodes_easycache.py does for its cache)."""
+    """Free the reference cache and the LoRA's device copies when a sampling run ends, so their VRAM is not
+    held between runs or between the chains of a workflow (as comfy_extras/nodes_easycache.py does for its cache)."""
     def wrapper(executor, *args, **kwargs):
         try:
             return executor(*args, **kwargs)
         finally:
-            adapter.ref_cache.clear()
+            adapter.release()
     return wrapper
 
 
@@ -441,9 +451,8 @@ class AnimaRefAdapterLoader:
                                                             m.get_model_object("process_latent_in")))
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
                                _make_wrapper(adapter, ref_offset_h))
-        if adapter.asym:
-            m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY,
-                                   _make_outer_sample_wrapper(adapter))
+        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY,
+                               _make_outer_sample_wrapper(adapter))
         return (m,)
 
 
@@ -569,8 +578,7 @@ class AnimaRefAdapter:
         m = model.clone()
         m.model_options["transformer_options"][OPTIONS_REF_KEY] = refs
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY, _make_wrapper(adapter, 1.0))
-        if adapter.asym:
-            m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY, _make_outer_sample_wrapper(adapter))
+        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY, _make_outer_sample_wrapper(adapter))
 
         m.set_model_sampler_post_cfg_function(self._post_cfg(ref_guidance, correction, ref_end))
         return (m,)

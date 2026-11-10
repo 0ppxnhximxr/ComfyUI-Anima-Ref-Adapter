@@ -68,6 +68,7 @@ def adapter(count=28):
         weights[f"blocks.{i}.self_attn.q_proj"] = entry
     obj.block_indices = set(range(count))
     obj.weights, obj.key = weights, ("adapter", 1.0)
+    obj.ref_cache, obj.on_device = {}, {}
     return obj
 
 
@@ -135,6 +136,19 @@ class HookTests(unittest.TestCase):
         torch.testing.assert_close(result(base, 2), torch.full((1, 2), 3.0))
         torch.testing.assert_close(result(expanded, 3), torch.full((1, 2), 3.0))
         self.assertEqual(before, tuple(ad.weights))
+
+    def test_device_copies_are_released_and_cpu_weights_kept(self):
+        model, ad = TinyAnima(28), adapter()
+        cpu = {name: entry[1] for name, entry in ad.weights.items()}
+        ad.install(model)
+        active(ad)
+        result(model, 0)
+        self.assertTrue(ad.on_device)
+        ad.release()
+        self.assertFalse(ad.on_device)
+        for name, entry in ad.weights.items():
+            self.assertIs(entry[1], cpu[name])
+        torch.testing.assert_close(result(model, 0), torch.full((1, 2), 1.0))
 
     def test_inactive_adapter_does_not_change_model(self):
         model, ad = TinyAnima(40), adapter()

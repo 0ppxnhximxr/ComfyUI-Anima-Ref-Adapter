@@ -146,6 +146,17 @@ class BackendTests(unittest.TestCase):
                 actual = model.blocks[0].self_attn.q_proj(torch.ones(1, 2))
                 torch.testing.assert_close(actual, torch.full((1, 2), expected))
 
+    def test_sampling_exit_releases_device_copies_and_keeps_cpu_weights(self):
+        model = Model()
+        self.adapter.install(model)
+        cpu = self.adapter.lora["blocks.0.self_attn.q_proj"]["tgt"][1]
+        self.backend._STATE.update(adapter=self.adapter, stream="tgt")
+        model.blocks[0].self_attn.q_proj(torch.ones(1, 2))
+        self.assertTrue(self.adapter.on_device)
+        self.backend.outer_wrapper(self.adapter)(lambda: None)
+        self.assertFalse(self.adapter.on_device)
+        self.assertIs(self.adapter.lora["blocks.0.self_attn.q_proj"]["tgt"][1], cpu)
+
     def test_fp8_scales_are_applied_before_lora_delta(self):
         write_adapter(self.path, fp8=True)
         adapter = self.backend.Adapter(str(self.path))
