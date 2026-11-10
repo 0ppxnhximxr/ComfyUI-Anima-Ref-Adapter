@@ -115,14 +115,39 @@ class IntegrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CLIP"):
                     nodes.AnimaRefAdapter().apply(None, None, None, path.name, 4.5, "apg")
 
-    def test_zero_snapref_strength_is_a_true_bypass(self):
+    def test_zero_snapref_ref_weight_is_a_true_bypass(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "renamed.safetensors"
             write_adapter(path)
             model = object()
             with patch.object(nodes, "_lora_path", return_value=str(path)):
-                result = nodes.AnimaRefAdapter().apply(model, None, None, path.name, 4.5, "apg", strength=0.)
+                result = nodes.AnimaRefAdapter().apply(model, None, None, path.name, 4.5, "apg", ref_weight=0.,
+                                                       snapref_guidance=True)
             self.assertIs(result[0], model)
+
+    def test_snapref_ignores_legacy_strength(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "renamed.safetensors"
+            write_adapter(path)
+            seen = {}
+            def fake_apply(model, clip, vae, image, path, mode, caption, weight, *rest):
+                seen["weight"] = weight
+                return (model,)
+            with patch.object(nodes, "_lora_path", return_value=str(path)),                     patch.object(nodes.snapref, "apply", side_effect=fake_apply):
+                nodes.AnimaRefAdapter().apply(object(), None, None, path.name, 4.5, "apg", strength=0., ref_weight=1.5)
+            self.assertEqual(seen["weight"], 1.5)
+
+    def test_format_route_reads_metadata_without_download(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap, legacy = Path(d) / "snap.safetensors", Path(d) / "legacy.safetensors"
+            write_adapter(snap)
+            save_file({"x": torch.ones(1)}, str(legacy))
+            paths = {"snap.safetensors": str(snap), "legacy.safetensors": str(legacy)}
+            with patch.object(nodes.folder_paths, "get_full_path", lambda kind, name: paths.get(name), create=True):
+                self.assertEqual(nodes._adapter_format("snap.safetensors"), "snapref")
+                self.assertEqual(nodes._adapter_format("legacy.safetensors"), "legacy")
+                self.assertEqual(nodes._adapter_format(nodes.HF_FILES[0]), "legacy")
+                self.assertIsNone(nodes._adapter_format("missing.safetensors"))
 
 
 class BackendTests(unittest.TestCase):

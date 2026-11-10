@@ -99,13 +99,14 @@ The **Anima Ref Adapter** node also reads [SnapRef](https://github.com/ArcAnima/
 into `ComfyUI/models/loras/` and open
 [`workflows/anima_ref_adapter_snapref.json`](workflows/anima_ref_adapter_snapref.json).
 Connect the Anima **CLIP** output to the node's optional `clip` input; SnapRef needs
-it even when `ref_caption` is empty. The adapter format is detected from metadata,
+it even when `ref_caption` is empty. The node shows only the inputs that apply to the
+selected file: pilot/v2 inputs for pilot/v2 adapters, SnapRef inputs for SnapRef adapters. The adapter format is detected from metadata,
 so renaming the file is fine. Existing pilot/v2 workflows keep their settings and behavior.
 
 | setting | SnapRef behavior |
 |---|---|
 | `snapref_mode` | `cs`: character and style; `char`: character only, with style from your prompt/model |
-| `strength` | Linear reference attention weight: 1 = trained default, 0 = bypass. This is separate from the LoRA multiplier used by pilot/v2. |
+| `ref_weight` | Linear reference attention weight: 1 = trained default, 0 = bypass. pilot/v2 adapters use `strength` (LoRA multiplier) instead. |
 | `ref_caption` | Optional appearance tags for the reference; empty works. |
 | `snapref_guidance` | Off by default: only the positive CFG branch reads the reference, as trained. On: both branches read it and `ref_guidance`, `correction`, and `ref_end` apply. |
 | `ref_megapixels` | Maximum reference area; small images are not enlarged. |

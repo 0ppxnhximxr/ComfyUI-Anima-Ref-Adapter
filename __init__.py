@@ -533,7 +533,8 @@ class AnimaRefAdapter:
                                                   "toward the reference at one extra model call per step"}),
             "correction": (["apg", "rescale", "none"], {"tooltip": "keeps colors in check at high cfg and ref_guidance"}),
         }, "optional": {
-            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                   "tooltip": "pilot/v2 adapters: LoRA strength. SnapRef adapters use ref_weight instead"}),
             "ref_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                                   "tooltip": "last step with ref_guidance, as a fraction of the denoising; the reference "
                                              "stays in after it. ~0.6 saves time with nearly the same image"}),
@@ -545,6 +546,9 @@ class AnimaRefAdapter:
                                        "tooltip": "SnapRef only: optional reference appearance tags; empty works"}),
             "snapref_guidance": ("BOOLEAN", {"default": False, "tooltip": "SnapRef only: enable ref_guidance, correction "
                                      "and ref_end. Off keeps the trained positive-only reference behavior"}),
+            "ref_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                     "tooltip": "SnapRef only: weight of the reference in attention (1 = trained, "
+                                                "0 = adapter off). Its LoRA always runs at its trained strength"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -552,17 +556,17 @@ class AnimaRefAdapter:
     CATEGORY = "Anima Ref Adapter"
 
     def apply(self, model, vae, image, lora_name, ref_guidance, correction, strength=1.0, ref_end=1.0, ref_megapixels=1.0,
-              clip=None, snapref_mode="cs", ref_caption="", snapref_guidance=False):
+              clip=None, snapref_mode="cs", ref_caption="", snapref_guidance=False, ref_weight=1.0):
+        """The adapter file's format picks the backend and the inputs that apply; the frontend extension
+        (js/anima_ref_adapter.js) shows only those."""
         from . import snapref
         path = _lora_path(lora_name)
-        if snapref.metadata(path) is not None:
-            (m,) = snapref.apply(model, clip, vae, image, path, snapref_mode, ref_caption, strength,
-                                 ref_megapixels, snapref_guidance)
-            if strength == 0 or not snapref_guidance:
-                return (m,)
-        else:
+        if snapref.metadata(path) is None:
             return self._apply_legacy(model, vae, image, path, ref_guidance, correction, strength, ref_end, ref_megapixels)
-        m.set_model_sampler_post_cfg_function(self._post_cfg(ref_guidance, correction, ref_end))
+        (m,) = snapref.apply(model, clip, vae, image, path, snapref_mode, ref_caption, ref_weight,
+                             ref_megapixels, snapref_guidance)
+        if m is not model and snapref_guidance:
+            m.set_model_sampler_post_cfg_function(self._post_cfg(ref_guidance, correction, ref_end))
         return (m,)
 
     def _apply_legacy(self, model, vae, image, path, ref_guidance, correction, strength, ref_end, ref_megapixels):
@@ -690,6 +694,31 @@ NODE_CLASS_MAPPINGS = {
     "AnimaRefLatent": AnimaRefLatent,
     "AnimaRefGuider": AnimaRefGuider,
 }
+WEB_DIRECTORY = "./js"
+
+
+def _adapter_format(name: str) -> str | None:
+    """"snapref" or "legacy" for a lora_name, without downloading; None when the file cannot be read."""
+    path = folder_paths.get_full_path("loras", name)
+    if path is None:
+        return "legacy" if name in HF_FILES else None  # released files not downloaded yet are pilot/v2 adapters
+    from . import snapref
+    try:
+        return "legacy" if snapref.metadata(path) is None else "snapref"
+    except Exception:
+        return None
+
+
+try:
+    from aiohttp import web
+    from server import PromptServer
+
+    @PromptServer.instance.routes.get("/anima_ref_adapter/format")
+    async def _format_route(request):
+        return web.json_response({"format": _adapter_format(request.query.get("name", ""))})
+except Exception:  # no server (tests, scripts)
+    pass
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AnimaRefAdapter": "Anima Ref Adapter",
     "AnimaRefAdapterLoader": "Anima Ref Adapter Loader",

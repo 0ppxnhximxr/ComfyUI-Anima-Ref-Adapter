@@ -190,7 +190,7 @@ def _slice_batch(value, sl, batch):
     return value
 
 
-def make_wrapper(adapter, latent, conditioning, mode, strength, in_uncond):
+def make_wrapper(adapter, latent, conditioning, mode, weight, in_uncond):
     def wrapper(executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
         if "multigpu_thread_device" in kwargs.get("transformer_options", {}):
             raise ValueError("SnapRef does not support core MultiGPU sampling")
@@ -212,7 +212,7 @@ def make_wrapper(adapter, latent, conditioning, mode, strength, in_uncond):
 
         def run(xs, ts, cs, fs, mask, with_ref, kw, rows=None):
             previous = _STATE.copy()
-            _set_state(dm, {"cache": cache, "bias": math.log(strength), "rows": rows} if with_ref else None)
+            _set_state(dm, {"cache": cache, "bias": math.log(weight), "rows": rows} if with_ref else None)
             _STATE.update(adapter=adapter, stream="tgt")
             try:
                 return executor(xs, ts, cs, fs, mask, **kw)
@@ -246,13 +246,12 @@ def outer_wrapper(adapter):
     return wrapper
 
 
-def apply(model, clip, vae, image, path, mode, caption, strength, megapixels, guidance):
-    if strength == 0:
+def apply(model, clip, vae, image, path, mode, caption, weight, megapixels, guidance):
+    """weight: linear weight of the reference keys in attention (1 = trained, 0 = the model unchanged)."""
+    if weight == 0:
         return (model,)
     if clip is None:
         raise ValueError("SnapRef requires the Anima CLIP input; connect the text encoder to clip")
-    if not math.isfinite(strength) or strength < 0:
-        raise ValueError("SnapRef strength must be finite and nonnegative")
     key = (os.path.abspath(path), os.stat(path).st_mtime_ns)
     if key not in _adapters:
         _adapters[key] = Adapter(path)
@@ -272,6 +271,6 @@ def apply(model, clip, vae, image, path, mode, caption, strength, megapixels, gu
     cond = clip.encode_from_tokens_scheduled(clip.tokenize(caption.strip()))[0]
     m = model.clone()
     m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
-                           make_wrapper(adapter, latent, cond, mode, strength, guidance))
+                           make_wrapper(adapter, latent, cond, mode, weight, guidance))
     m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY, outer_wrapper(adapter))
     return (m,)
