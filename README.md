@@ -118,10 +118,11 @@ on the same model chain. Reference K/V is released when sampling finishes, inclu
 This backend uses ComfyUI's Anima attention APIs; use ComfyUI 0.29.0 or newer.
 Core MultiGPU sampling is rejected because the stream hooks share adapter state.
 
-The SnapRef path also supports sorryhyun's Spectrum/Mod Guidance hooks: the clean
-reference is encoded without target modulation, and a mixed CFG batch stays intact
-while only its positive rows read the reference. This prevents the reported 4-vs-2
-batch error. Spectrum 2.13.4 additionally needs its own projection-row expansion fix
+The SnapRef path also works with other extensions that steer the target, such as
+sorryhyun's Spectrum/Mod Guidance, without relying on their internals: the clean
+reference runs the blocks' own forward, so module hooks on them do not reach it, and the
+model call keeps its CFG batch whole while only the rows that use the reference read it
+inside self-attention. This prevents the reported 4-vs-2 batch error. Spectrum 2.13.4 additionally needs its own projection-row expansion fix
 for actual image batches larger than one; that is separate from SnapRef's CFG handling.
 
 ## Speed and compatibility

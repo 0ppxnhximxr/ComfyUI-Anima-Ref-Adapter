@@ -209,7 +209,7 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'MultiGPU'):
             wrapper(None, None, None, None, transformer_options={'multigpu_thread_device': 'cuda:1'})
 
-    def test_mixed_cfg_slices_extras_and_keeps_target_lora_without_reference(self):
+    def test_mixed_cfg_keeps_batch_whole_and_marks_reference_rows(self):
         model = Model()
         model.preprocess_text_embeds = lambda cross, ids, weights: cross
         seen = []
@@ -218,16 +218,17 @@ class BackendTests(unittest.TestCase):
             class_obj = model
             def __call__(self, x, t, context, fps, mask, **kw):
                 state = getattr(model.blocks[0].self_attn, backend.STATE_ATTR)
-                flag = kw['transformer_options']['cond_or_uncond']
-                seen.append((flag, kw['control']['input'][0].tolist(), mask.tolist(), state is not None))
-                return model.blocks[0].self_attn.q_proj(x) + (100 if state else 0)
+                seen.append((x.shape[0], kw['transformer_options']['cond_or_uncond'], kw['control'] is control,
+                             state['rows'].tolist(), state['plain'].tolist()))
+                return model.blocks[0].self_attn.q_proj(x)
+        control = {'input': [torch.tensor([30, 40, 50, 60])]}
         wrapper = backend.make_wrapper(self.adapter, torch.ones(1, 2), (torch.ones(1, 1, 2), {}), 'cs', 1., False)
         with patch.object(backend, '_encode_reference', return_value=[(torch.ones(1), torch.ones(1))]):
-            out = wrapper(Executor(), torch.ones(2, 2), torch.ones(2), torch.ones(2, 1, 2),
-                          padding_mask=torch.tensor([10, 20]), control={'input': [torch.tensor([30, 40])]},
+            out = wrapper(Executor(), torch.ones(4, 2), torch.ones(4), torch.ones(4, 1, 2),
+                          padding_mask=torch.zeros(4), control=control,
                           transformer_options={'cond_or_uncond': [0, 1]})
-        torch.testing.assert_close(out, torch.tensor([[103., 103.], [3., 3.]]))
-        self.assertEqual(seen, [([0], [30], [10], True), ([1], [40], [20], False)])
+        torch.testing.assert_close(out, torch.full((4, 2), 3.))  # target LoRA on every row
+        self.assertEqual(seen, [(4, [0, 1], True, [0, 1], [2, 3])])
         self.assertIsNone(getattr(model.blocks[0].self_attn, backend.STATE_ATTR))
         self.assertEqual(backend._STATE, {'adapter': None, 'stream': None})
 
@@ -251,58 +252,48 @@ class BackendTests(unittest.TestCase):
         self.assertIsNone(getattr(model.blocks[0].self_attn, backend.STATE_ATTR))
         self.assertEqual(backend._STATE, {'adapter': None, 'stream': None})
 
-    def test_mod_guidance_keeps_cfg_batch_and_is_suspended_only_for_reference(self):
-        model = Model()
-        delta = torch.tensor([[[10., 10.]], [[20., 20.]]])
-        block_state = object()
-        model.t_embedding_norm = SimpleNamespace(_anima_mod_delta=delta)
-        model._anima_mod_block_state = block_state
-        model.preprocess_text_embeds = lambda cross, ids, weights: cross
+    def test_reference_encode_bypasses_foreign_module_hooks(self):
+        """Hooks such as Spectrum Mod Guidance's on the norm and blocks must not reach the clean reference."""
         backend = self.backend
-        calls = []
-        case = self
-        class Executor:
-            class_obj = model
-            def __call__(self, x, *a, **kw):
-                case.assertEqual(x.shape[0], 2, 'Mod Guidance owns a two-row CFG batch')
-                case.assertIs(model.t_embedding_norm._anima_mod_delta, delta)
-                case.assertIs(model._anima_mod_block_state, block_state)
-                state = getattr(model.blocks[0].self_attn, backend.STATE_ATTR)
-                calls.append(state['rows'])
-                return x
-        def encode(*args):
-            case.assertIsNone(model.t_embedding_norm._anima_mod_delta)
-            case.assertIsNone(model._anima_mod_block_state)
-            return [(torch.ones(1), torch.ones(1))]
-        wrapper = backend.make_wrapper(self.adapter, torch.ones(1, 2), (torch.ones(1, 1, 2), {}), 'cs', 1., False)
-        with patch.object(backend, '_encode_reference', side_effect=encode):
-            result = wrapper(Executor(), torch.ones(2, 2), torch.ones(2), torch.ones(2, 1, 2),
-                             transformer_options={'cond_or_uncond': [0, 1]})
-        self.assertEqual(result.shape[0], 2)
-        self.assertEqual(calls, [[0]])
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+            def forward(self, x, emb, context, **kw):
+                return x + emb.mean()
+        class Embed(torch.nn.Module):
+            def forward(self, t):
+                return (t + 1, None)
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([Block()])
+        model.t_embedder = torch.nn.ModuleList([torch.nn.Identity(), Embed()])
+        model.t_embedding_norm = torch.nn.Identity()
+        model.pos_embedder = None
+        model.prepare_embedded_sequence = lambda ref, **kw: (torch.zeros(1, 1, 1, 1, 2), None, None)
+        def steer(*args):
+            raise AssertionError('a target hook ran on the reference')
+        model.t_embedding_norm.register_forward_hook(steer)
+        model.t_embedder[1].register_forward_hook(steer)
+        model.blocks[0].register_forward_pre_hook(steer)
+        self.adapter.install(model)
+        with patch.object(backend, '_rope_from_positions', return_value=torch.zeros(1)), \
+                patch.object(backend, '_frame_positions', return_value=(None, None, None)):
+            record = backend._encode_reference(self.adapter, model, torch.zeros(1, 2, 1, 2, 2), None, (2, 2), 'cs')
+        self.assertEqual(len(record), 1)
 
-    def test_reference_mod_guidance_state_is_restored_on_failure(self):
-        model = Model()
-        delta, block_state = object(), object()
-        model.t_embedding_norm = SimpleNamespace(_anima_mod_delta=delta)
-        model._anima_mod_block_state = block_state
-        model.preprocess_text_embeds = lambda *a: torch.ones(1)
-        wrapper = self.backend.make_wrapper(self.adapter, torch.ones(1), (torch.ones(1), {}), 'cs', 1., False)
-        with patch.object(self.backend, '_encode_reference', side_effect=RuntimeError('reference failed')):
-            with self.assertRaisesRegex(RuntimeError, 'reference failed'):
-                wrapper(SimpleNamespace(class_obj=model), torch.ones(2, 2), None, None)
-        self.assertIs(model.t_embedding_norm._anima_mod_delta, delta)
-        self.assertIs(model._anima_mod_block_state, block_state)
-
-    def test_mixed_reference_mask_keeps_negative_rows_reference_free(self):
+    def test_mixed_rows_attend_separately_and_bias_only_reference_logits(self):
         model = Model()
         self.adapter.install(model)
         attn = model.blocks[0].self_attn
         q = torch.zeros(2, 1, 1, 2)
         attn.compute_qkv = lambda *a, **kw: (q, q, q)
         attn.output_proj = attn.output_dropout = torch.nn.Identity()
+        def compute_attention(q, k, v, **kw):
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+            return out.transpose(1, 2).flatten(2)
+        attn.compute_attention = compute_attention
         self.backend._set_state(model, {'cache': [(torch.zeros(1, 1, 1, 2), torch.full((1, 1, 1, 2), 2.))],
-                                        'bias': math.log(.5), 'rows': [0]})
+                                        'bias': math.log(.5), 'rows': torch.tensor([0]), 'plain': torch.tensor([1])})
         self.addCleanup(self.backend._set_state, model, None)
         actual = attn(torch.zeros(2, 1, 2))
         torch.testing.assert_close(actual, torch.tensor([[[2/3, 2/3]], [[0., 0.]]]))
